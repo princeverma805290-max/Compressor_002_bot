@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: telegram-compressor-bot
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: PORT
+        value: 10000
+    # FFmpeg install karne ke liye
+    buildFilter:
+      paths:
+        - requirements.txt
+        - "**/*.py"
