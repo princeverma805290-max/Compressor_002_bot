@@ -1,11 +1,10 @@
 """
 Advanced Telegram Video Compressor Bot
-- Real download progress bar with speed + ETA
-- Real FFmpeg compression progress (frame/fps/time) with bar
-- Real upload progress bar with speed + ETA
+- Real download/compression/upload progress bars
 - Resolution: 144p / 360p / 480p / 720p / 1080p
-- Custom Thumbnail + Title/Caption
-- Render free CPU optimized
+- Custom Thumbnail + Title
+- Owner-only access
+- Compatible with python-telegram-bot 20.7
 """
 
 import os
@@ -13,7 +12,6 @@ import re
 import asyncio
 import logging
 import time
-import math
 from pathlib import Path
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -29,13 +27,21 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ── States ──────────────────────────────────────────────────────────────────
+# ── Config ───────────────────────────────────────────────────────────────────
+BOT_TOKEN    = os.environ.get("BOT_TOKEN", "")
+OWNER_ID     = int(os.environ.get("OWNER_ID", "0"))   # Set in Render env vars
+DOWNLOAD_DIR = Path("downloads")
+OUTPUT_DIR   = Path("outputs")
+DOWNLOAD_DIR.mkdir(exist_ok=True)
+OUTPUT_DIR.mkdir(exist_ok=True)
+
+# ── States ───────────────────────────────────────────────────────────────────
 WAITING_VIDEO     = 1
 WAITING_QUALITY   = 2
 WAITING_THUMBNAIL = 3
 WAITING_TITLE     = 4
 
-# ── Resolution presets ──────────────────────────────────────────────────────
+# ── Resolution presets ────────────────────────────────────────────────────────
 RESOLUTIONS = {
     "144p":  {"h": 144,  "w": 256,  "crf": 40, "audio": "64k",  "emoji": "📱"},
     "360p":  {"h": 360,  "w": 640,  "crf": 36, "audio": "96k",  "emoji": "📺"},
@@ -44,43 +50,34 @@ RESOLUTIONS = {
     "1080p": {"h": 1080, "w": 1920, "crf": 24, "audio": "192k", "emoji": "🟣"},
 }
 
-BOT_TOKEN    = os.environ.get("BOT_TOKEN", "")
-DOWNLOAD_DIR = Path("downloads")
-OUTPUT_DIR   = Path("outputs")
-DOWNLOAD_DIR.mkdir(exist_ok=True)
-OUTPUT_DIR.mkdir(exist_ok=True)
-
-# ── Progress UI helpers ──────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def make_bar(pct: float, width: int = 16) -> str:
-    """Unicode block progress bar  ████████░░░░  60%"""
-    filled = int(width * pct / 100)
-    empty  = width - filled
-    return "█" * filled + "░" * empty
+    filled = int(width * min(pct, 100) / 100)
+    return "█" * filled + "░" * (width - filled)
 
 def fmt_size(b: int) -> str:
-    if b < 1024:        return f"{b} B"
-    if b < 1024**2:     return f"{b/1024:.1f} KB"
-    if b < 1024**3:     return f"{b/1024**2:.1f} MB"
+    if b < 1024:      return f"{b} B"
+    if b < 1024**2:   return f"{b/1024:.1f} KB"
+    if b < 1024**3:   return f"{b/1024**2:.1f} MB"
     return f"{b/1024**3:.2f} GB"
 
-def fmt_time(secs: float) -> str:
-    secs = int(max(0, secs))
-    if secs < 60:   return f"{secs}s"
-    if secs < 3600: return f"{secs//60}m {secs%60:02d}s"
-    return f"{secs//3600}h {(secs%3600)//60:02d}m"
+def fmt_time(s: float) -> str:
+    s = int(max(0, s))
+    if s < 60:   return f"{s}s"
+    if s < 3600: return f"{s//60}m {s%60:02d}s"
+    return f"{s//3600}h {(s%3600)//60:02d}m"
 
 def fmt_speed(bps: float) -> str:
-    if bps < 1024:      return f"{bps:.0f} B/s"
-    if bps < 1024**2:   return f"{bps/1024:.1f} KB/s"
+    if bps < 1024:    return f"{bps:.0f} B/s"
+    if bps < 1024**2: return f"{bps/1024:.1f} KB/s"
     return f"{bps/1024**2:.1f} MB/s"
 
 async def safe_edit(msg, text: str):
-    """Edit message, ignore flood/same-content errors."""
     try:
         await msg.edit_text(text, parse_mode="Markdown")
     except RetryAfter as e:
-        await asyncio.sleep(e.retry_after + 0.5)
+        await asyncio.sleep(e.retry_after + 1)
         try:
             await msg.edit_text(text, parse_mode="Markdown")
         except Exception:
@@ -90,230 +87,64 @@ async def safe_edit(msg, text: str):
     except Exception:
         pass
 
-# ── Download with real progress ──────────────────────────────────────────────
+def is_owner(update: Update) -> bool:
+    if OWNER_ID == 0:
+        return True   # Owner ID set nahi toh sab use kar sakte hain
+    return update.effective_user.id == OWNER_ID
 
-async def download_with_progress(bot, file_obj, dest_path: Path,
-                                  status_msg, total_size: int,
-                                  label: str = "⬇️ Downloading"):
-    """
-    Download file in chunks and update progress message every ~2 seconds.
-    Returns elapsed seconds.
-    """
-    CHUNK = 512 * 1024  # 512 KB per chunk
-    UPDATE_EVERY = 2.0  # seconds between edits
+# ── Download with progress ────────────────────────────────────────────────────
 
-    tg_file = await bot.get_file(file_obj.file_id)
-    url      = tg_file.file_path          # direct download URL
-
+async def download_with_progress(bot, file_id: str, dest: Path,
+                                  status_msg, total_size: int):
     import aiohttp
-    start    = time.time()
-    last_upd = start
+    tg_file = await bot.get_file(file_id)
+    url     = tg_file.file_path
+
+    CHUNK      = 512 * 1024
+    UPDATE_INT = 2.0
+    start      = time.time()
+    last_upd   = start
     downloaded = 0
 
     async with aiohttp.ClientSession() as session:
         async with session.get(url) as resp:
             resp.raise_for_status()
-            if total_size == 0:
+            if not total_size:
                 total_size = int(resp.headers.get("Content-Length", 0))
-
-            with open(dest_path, "wb") as f:
+            with open(dest, "wb") as f:
                 async for chunk in resp.content.iter_chunked(CHUNK):
                     f.write(chunk)
                     downloaded += len(chunk)
                     now = time.time()
-
-                    if now - last_upd >= UPDATE_EVERY:
+                    if now - last_upd >= UPDATE_INT:
                         elapsed = now - start
-                        speed   = downloaded / elapsed if elapsed > 0 else 0
+                        speed   = downloaded / elapsed if elapsed else 0
                         pct     = min(downloaded / total_size * 100, 99) if total_size else 0
-                        eta     = (total_size - downloaded) / speed if speed > 0 and total_size else 0
-
-                        bar = make_bar(pct)
-                        txt = (
-                            f"*{label}*\n\n"
+                        eta     = (total_size - downloaded) / speed if speed and total_size else 0
+                        bar     = make_bar(pct)
+                        await safe_edit(status_msg,
+                            f"⬇️ *Downloading Video*\n\n"
                             f"`[{bar}]` `{pct:.1f}%`\n\n"
                             f"📥 `{fmt_size(downloaded)}`"
                             + (f" / `{fmt_size(total_size)}`" if total_size else "")
-                            + f"\n"
-                            f"⚡ Speed:  `{fmt_speed(speed)}`\n"
+                            + f"\n⚡ Speed:   `{fmt_speed(speed)}`\n"
                             f"⏱️ Elapsed: `{fmt_time(elapsed)}`\n"
-                            f"⏳ ETA:    `{fmt_time(eta)}`"
+                            f"⏳ ETA:     `{fmt_time(eta)}`"
                         )
-                        await safe_edit(status_msg, txt)
                         last_upd = now
 
     elapsed = time.time() - start
     return elapsed, downloaded
 
-# ── FFmpeg compression with real progress ────────────────────────────────────
+# ── Get video duration ────────────────────────────────────────────────────────
 
-async def compress_with_progress(cmd: list, total_duration_s: float,
-                                  status_msg, res_key: str,
-                                  crf: int, audio_br: str):
-    """
-    Run FFmpeg, parse stderr for time= progress, update message every 3s.
-    Returns (returncode, stderr_text, elapsed)
-    """
-    UPDATE_EVERY = 3.0
-    start        = time.time()
-    last_upd     = start
-    stderr_lines = []
-
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.PIPE,
-    )
-
-    current_time_s = 0.0
-    fps_cur        = 0.0
-    speed_cur      = 0.0
-    bitrate_cur    = ""
-
-    async def read_stderr():
-        nonlocal current_time_s, fps_cur, speed_cur, bitrate_cur
-        async for raw in proc.stderr:
-            line = raw.decode(errors="replace").strip()
-            stderr_lines.append(line)
-
-            # Parse: frame=  42 fps= 12 ... time=00:00:01.68 bitrate= 800kbits/s speed=0.56x
-            m_time    = re.search(r"time=(\d+):(\d+):(\d+\.\d+)", line)
-            m_fps     = re.search(r"fps=\s*([\d.]+)", line)
-            m_speed   = re.search(r"speed=\s*([\d.]+)x", line)
-            m_bitrate = re.search(r"bitrate=\s*([\d.]+\s*\S+)", line)
-
-            if m_time:
-                h, m, s = m_time.groups()
-                current_time_s = int(h)*3600 + int(m)*60 + float(s)
-            if m_fps:
-                fps_cur = float(m_fps.group(1))
-            if m_speed:
-                speed_cur = float(m_speed.group(1))
-            if m_bitrate:
-                bitrate_cur = m_bitrate.group(1).strip()
-
-    reader_task = asyncio.create_task(read_stderr())
-
-    while proc.returncode is None:
-        await asyncio.sleep(UPDATE_EVERY)
-        now     = time.time()
-        elapsed = now - start
-
-        pct = min(current_time_s / total_duration_s * 100, 99) if total_duration_s > 0 else 0
-        eta = ((total_duration_s - current_time_s) / speed_cur
-               if speed_cur > 0 and total_duration_s > 0 else 0)
-
-        bar = make_bar(pct)
-        processed_ts = fmt_time(current_time_s)
-        total_ts     = fmt_time(total_duration_s) if total_duration_s > 0 else "?"
-
-        txt = (
-            f"⚙️ *Compressing — {res_key}*\n\n"
-            f"`[{bar}]` `{pct:.1f}%`\n\n"
-            f"🎞️ Processed: `{processed_ts}` / `{total_ts}`\n"
-            f"🔢 FPS:       `{fps_cur:.1f}`\n"
-            f"⚡ Speed:    `{speed_cur:.2f}x`\n"
-            f"📡 Bitrate:  `{bitrate_cur or '—'}`\n"
-            f"⏱️ Elapsed:  `{fmt_time(elapsed)}`\n"
-            f"⏳ ETA:      `{fmt_time(eta)}`\n\n"
-            f"CRF `{crf}` | Audio `{audio_br}`"
-        )
-        await safe_edit(status_msg, txt)
-
-    await reader_task
-    await proc.wait()
-    elapsed = time.time() - start
-    stderr_text = "\n".join(stderr_lines)
-    return proc.returncode, stderr_text, elapsed
-
-# ── Upload with real progress ─────────────────────────────────────────────────
-
-async def upload_with_progress(message, output_path: Path, caption: str,
-                                 thumbnail_path, status_msg,
-                                 res_key: str, orig_size: int, comp_size: int,
-                                 compress_elapsed: float):
-    """
-    Upload video, show a simulated upload progress bar updated every 2s.
-    (Telegram Bot API does not expose real upload bytes, so we estimate from
-     time elapsed vs file size / assumed speed.)
-    """
-    UPDATE_EVERY = 2.0
-    file_size    = output_path.stat().st_size
-    start        = time.time()
-
-    # Run upload in background task while updating progress
-    upload_done   = asyncio.Event()
-    upload_error  = [None]
-
-    async def do_upload():
-        try:
-            with open(str(output_path), "rb") as vf:
-                if thumbnail_path and Path(thumbnail_path).exists():
-                    with open(thumbnail_path, "rb") as tf:
-                        await message.reply_video(
-                            video=vf, caption=caption,
-                            thumbnail=tf, supports_streaming=True,
-                            parse_mode="Markdown",
-                        )
-                else:
-                    await message.reply_video(
-                        video=vf, caption=caption,
-                        supports_streaming=True,
-                        parse_mode="Markdown",
-                    )
-        except Exception as e:
-            upload_error[0] = e
-        finally:
-            upload_done.set()
-
-    upload_task = asyncio.create_task(do_upload())
-
-    # Progress loop — estimate based on elapsed time
-    # Typical Telegram server upload speed ~1–3 MB/s on free tier
-    ASSUMED_SPEED = 1.2 * 1024 * 1024  # 1.2 MB/s estimate
-
-    while not upload_done.is_set():
-        await asyncio.sleep(UPDATE_EVERY)
-        if upload_done.is_set():
-            break
-
-        elapsed   = time.time() - start
-        estimated = min(elapsed * ASSUMED_SPEED, file_size * 0.97)
-        pct       = min(estimated / file_size * 100, 97) if file_size else 50
-        speed     = estimated / elapsed if elapsed > 0 else ASSUMED_SPEED
-        eta       = (file_size - estimated) / speed if speed > 0 else 0
-
-        bar = make_bar(pct)
-        reduction = (orig_size - comp_size) / orig_size * 100 if orig_size > 0 else 0
-
-        txt = (
-            f"⬆️ *Uploading — {res_key}*\n\n"
-            f"`[{bar}]` `{pct:.1f}%`\n\n"
-            f"📦 Size:      `{fmt_size(file_size)}`\n"
-            f"⚡ Speed:    `~{fmt_speed(speed)}`\n"
-            f"⏱️ Elapsed:  `{fmt_time(elapsed)}`\n"
-            f"⏳ ETA:      `~{fmt_time(eta)}`\n\n"
-            f"📉 Compression saved `{reduction:.1f}%`"
-        )
-        await safe_edit(status_msg, txt)
-
-    await upload_task
-
-    if upload_error[0]:
-        raise upload_error[0]
-
-    upload_elapsed = time.time() - start
-    return upload_elapsed
-
-# ── Get video duration via ffprobe ────────────────────────────────────────────
-
-async def get_duration(video_path: str) -> float:
+async def get_duration(path: str) -> float:
     try:
         proc = await asyncio.create_subprocess_exec(
             "ffprobe", "-v", "error",
             "-show_entries", "format=duration",
             "-of", "default=noprint_wrappers=1:nokey=1",
-            video_path,
+            path,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
         )
@@ -322,15 +153,133 @@ async def get_duration(video_path: str) -> float:
     except Exception:
         return 0.0
 
+# ── Compress with progress ────────────────────────────────────────────────────
+
+async def compress_with_progress(cmd, duration_s, status_msg, res_key, crf, audio_br):
+    UPDATE_INT = 3.0
+    start      = time.time()
+    stderr_buf = []
+    cur_time   = 0.0
+    fps        = 0.0
+    speed      = 0.0
+    bitrate    = ""
+
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    async def read_err():
+        nonlocal cur_time, fps, speed, bitrate
+        async for raw in proc.stderr:
+            line = raw.decode(errors="replace").strip()
+            stderr_buf.append(line)
+            m = re.search(r"time=(\d+):(\d+):(\d+\.\d+)", line)
+            if m:
+                h, mi, s = m.groups()
+                cur_time = int(h)*3600 + int(mi)*60 + float(s)
+            m2 = re.search(r"fps=\s*([\d.]+)", line)
+            if m2: fps = float(m2.group(1))
+            m3 = re.search(r"speed=\s*([\d.]+)x", line)
+            if m3: speed = float(m3.group(1))
+            m4 = re.search(r"bitrate=\s*([\d.]+\s*\S+bits/s)", line)
+            if m4: bitrate = m4.group(1).strip()
+
+    reader = asyncio.create_task(read_err())
+
+    while proc.returncode is None:
+        await asyncio.sleep(UPDATE_INT)
+        elapsed = time.time() - start
+        pct     = min(cur_time / duration_s * 100, 99) if duration_s else 0
+        eta     = (duration_s - cur_time) / speed if speed and duration_s else 0
+        bar     = make_bar(pct)
+        await safe_edit(status_msg,
+            f"⚙️ *Compressing — {res_key}*\n\n"
+            f"`[{bar}]` `{pct:.1f}%`\n\n"
+            f"🎞️ Processed: `{fmt_time(cur_time)}` / `{fmt_time(duration_s)}`\n"
+            f"🔢 FPS:       `{fps:.1f}`\n"
+            f"⚡ Speed:    `{speed:.2f}x realtime`\n"
+            f"📡 Bitrate:  `{bitrate or '—'}`\n"
+            f"⏱️ Elapsed:  `{fmt_time(elapsed)}`\n"
+            f"⏳ ETA:      `{fmt_time(eta)}`\n\n"
+            f"CRF `{crf}` | Audio `{audio_br}`"
+        )
+
+    await reader
+    await proc.wait()
+    return proc.returncode, "\n".join(stderr_buf), time.time() - start
+
+# ── Upload with progress ──────────────────────────────────────────────────────
+
+async def upload_with_progress(message, output_path, caption, thumb_path,
+                                status_msg, res_key, orig_size, comp_size):
+    file_size     = output_path.stat().st_size
+    start         = time.time()
+    done_evt      = asyncio.Event()
+    err_holder    = [None]
+    ASSUMED_SPEED = 1.2 * 1024 * 1024  # ~1.2 MB/s estimate
+
+    async def do_upload():
+        try:
+            with open(str(output_path), "rb") as vf:
+                if thumb_path and Path(thumb_path).exists():
+                    with open(thumb_path, "rb") as tf:
+                        await message.reply_video(
+                            video=vf, caption=caption,
+                            thumbnail=tf, supports_streaming=True,
+                            parse_mode="Markdown",
+                        )
+                else:
+                    await message.reply_video(
+                        video=vf, caption=caption,
+                        supports_streaming=True, parse_mode="Markdown",
+                    )
+        except Exception as e:
+            err_holder[0] = e
+        finally:
+            done_evt.set()
+
+    asyncio.create_task(do_upload())
+    reduction = (orig_size - comp_size) / orig_size * 100 if orig_size else 0
+
+    while not done_evt.is_set():
+        await asyncio.sleep(2)
+        if done_evt.is_set():
+            break
+        elapsed   = time.time() - start
+        estimated = min(elapsed * ASSUMED_SPEED, file_size * 0.97)
+        pct       = min(estimated / file_size * 100, 97) if file_size else 50
+        spd       = estimated / elapsed if elapsed else ASSUMED_SPEED
+        eta       = (file_size - estimated) / spd if spd else 0
+        bar       = make_bar(pct)
+        await safe_edit(status_msg,
+            f"⬆️ *Uploading — {res_key}*\n\n"
+            f"`[{bar}]` `{pct:.1f}%`\n\n"
+            f"📦 Size:     `{fmt_size(file_size)}`\n"
+            f"⚡ Speed:   `~{fmt_speed(spd)}`\n"
+            f"⏱️ Elapsed: `{fmt_time(elapsed)}`\n"
+            f"⏳ ETA:     `~{fmt_time(eta)}`\n\n"
+            f"📉 Compression saved `{reduction:.1f}%`"
+        )
+
+    if err_holder[0]:
+        raise err_holder[0]
+    return time.time() - start
+
 # ── /start ────────────────────────────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        await update.message.reply_text("❌ Aap is bot ko use karne ke authorized nahi hain!")
+        return WAITING_VIDEO
+
+    user = update.effective_user
     await update.message.reply_text(
+        f"👋 Welcome *{user.first_name}*!\n\n"
         "🎬 *Advanced Video Compressor Bot*\n\n"
-        "Har step ka *real-time progress* dikhata hoon:\n"
-        "• ⬇️ Download progress + speed + ETA\n"
-        "• ⚙️ Compression progress + FPS + speed\n"
-        "• ⬆️ Upload progress + speed + ETA\n\n"
+        "Real-time progress ke saath:\n"
+        "⬇️ Download → ⚙️ Compress → ⬆️ Upload\n\n"
         "📐 *Resolutions:* 144p / 360p / 480p / 720p / 1080p\n"
         "🖼️ Custom Thumbnail | ✏️ Custom Title\n\n"
         "📤 *Video bhejein shuru karne ke liye!*\n\n"
@@ -342,24 +291,26 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── /help ─────────────────────────────────────────────────────────────────────
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
+        return
     await update.message.reply_text(
         "📖 *Help Guide*\n\n"
         "*Steps:*\n"
         "1️⃣ Video bhejein (max 2GB)\n"
         "2️⃣ Resolution choose karein\n"
-        "3️⃣ Thumbnail bhejein ya skip karein\n"
-        "4️⃣ Title likhein ya skip karein\n"
-        "5️⃣ Har step ka progress bar dekhein!\n\n"
+        "3️⃣ Thumbnail bhejein ya skip\n"
+        "4️⃣ Title likhein ya skip\n"
+        "5️⃣ Real-time progress dekhein!\n\n"
         "*Resolution Guide:*\n"
-        "📱 *144p* — WhatsApp/forward (sabse chhota)\n"
+        "📱 *144p* — Sabse chhota (WhatsApp)\n"
         "📺 *360p* — Normal viewing\n"
         "🖥️ *480p* — SD quality\n"
         "🔵 *720p* — HD *(Recommended)*\n"
         "🟣 *1080p* — Full HD\n\n"
-        "*Progress Info:*\n"
+        "*Progress bars dikhate hain:*\n"
         "• Download: actual bytes + speed + ETA\n"
-        "• Compress: timestamp + FPS + speed multiplier\n"
-        "• Upload: size + estimated speed + ETA",
+        "• Compress: timestamp + FPS + speed\n"
+        "• Upload: size + speed estimate + ETA",
         parse_mode="Markdown",
     )
 
@@ -373,17 +324,16 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── Receive video ─────────────────────────────────────────────────────────────
 
 async def receive_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.message
-    video   = message.video or message.document
-
-    if not video:
-        await message.reply_text("❗ Sirf video files bhejein!")
+    if not is_owner(update):
+        await update.message.reply_text("❌ Unauthorized!")
         return WAITING_VIDEO
 
+    message    = update.message
+    video      = message.video or message.document
     total_size = getattr(video, "file_size", 0) or 0
 
     if total_size > 2 * 1024 * 1024 * 1024:
-        await message.reply_text("❗ File 2GB se badi hai! Allowed nahi.")
+        await message.reply_text("❗ File 2GB se badi hai!")
         return WAITING_VIDEO
 
     status_msg = await message.reply_text(
@@ -403,28 +353,25 @@ async def receive_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         dest = DOWNLOAD_DIR / f"{user_id}_{int(time.time())}_input{ext}"
 
         elapsed, dl_bytes = await download_with_progress(
-            context.bot, video, dest, status_msg, total_size,
-            label="⬇️ Downloading Video"
+            context.bot, video.file_id, dest, status_msg, total_size
         )
+        speed_avg = dl_bytes / elapsed if elapsed else 0
 
-        speed_avg = dl_bytes / elapsed if elapsed > 0 else 0
-        await safe_edit(
-            status_msg,
+        await safe_edit(status_msg,
             f"✅ *Download Complete!*\n\n"
             f"`[████████████████]` `100%`\n\n"
-            f"📥 Size:     `{fmt_size(dl_bytes)}`\n"
+            f"📥 Size:      `{fmt_size(dl_bytes)}`\n"
             f"⚡ Avg Speed: `{fmt_speed(speed_avg)}`\n"
-            f"⏱️ Time:     `{fmt_time(elapsed)}`",
+            f"⏱️ Time:      `{fmt_time(elapsed)}`"
         )
 
         context.user_data.update({
-            "video_path":     str(dest),
+            "video_path": str(dest),
             "thumbnail_path": None,
-            "title":          None,
-            "total_size":     dl_bytes,
+            "title": None,
+            "total_size": dl_bytes,
         })
 
-        # Resolution keyboard
         keyboard = [
             [InlineKeyboardButton("📱 144p  — Sabse chhota",  callback_data="res_144p")],
             [InlineKeyboardButton("📺 360p  — Chhota size",   callback_data="res_360p")],
@@ -456,16 +403,14 @@ async def resolution_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
     await query.answer()
     res_key = query.data.replace("res_", "")
     preset  = RESOLUTIONS[res_key]
-
     context.user_data["resolution"] = res_key
     context.user_data["preset"]     = preset
 
     await query.edit_message_text(
-        f"✅ *Resolution set:* `{res_key}` — {preset['emoji']} "
-        f"`{preset['w']}×{preset['h']}`  CRF `{preset['crf']}`",
+        f"✅ *Resolution set:* `{res_key}` {preset['emoji']} "
+        f"— `{preset['w']}×{preset['h']}` | CRF `{preset['crf']}`",
         parse_mode="Markdown",
     )
-
     kb = [[InlineKeyboardButton("⏭️ Skip Thumbnail", callback_data="skip_thumbnail")]]
     await query.message.reply_text(
         "🖼️ *Thumbnail* (optional)\n\nImage bhejein ya skip karein:",
@@ -479,8 +424,7 @@ async def resolution_callback(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def receive_thumbnail(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.message
     if not (message.photo or (
-        message.document
-        and message.document.mime_type
+        message.document and message.document.mime_type
         and message.document.mime_type.startswith("image/")
     )):
         await message.reply_text("❗ Photo bhejein ya skip karein!")
@@ -488,12 +432,12 @@ async def receive_thumbnail(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     st = await message.reply_text("⬇️ Thumbnail download ho raha hai...")
     try:
-        fobj  = message.photo[-1] if message.photo else message.document
-        f     = await context.bot.get_file(fobj.file_id)
-        path  = DOWNLOAD_DIR / f"{update.effective_user.id}_{int(time.time())}_thumb.jpg"
+        fobj = message.photo[-1] if message.photo else message.document
+        f    = await context.bot.get_file(fobj.file_id)
+        path = DOWNLOAD_DIR / f"{update.effective_user.id}_{int(time.time())}_thumb.jpg"
         await f.download_to_drive(str(path))
         context.user_data["thumbnail_path"] = str(path)
-        await safe_edit(st, "✅ Thumbnail set ho gaya!")
+        await safe_edit(st, "✅ Thumbnail set!")
     except Exception as e:
         context.user_data["thumbnail_path"] = None
         await safe_edit(st, f"⚠️ Thumbnail skip (error: {e})")
@@ -537,191 +481,44 @@ async def skip_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ── Main pipeline ─────────────────────────────────────────────────────────────
 
-async def run_pipeline(update_or_query, context: ContextTypes.DEFAULT_TYPE):
-    message = update_or_query.message
+async def run_pipeline(src, context: ContextTypes.DEFAULT_TYPE):
+    message    = src.message
+    video_path = context.user_data.get("video_path")
+    thumb_path = context.user_data.get("thumbnail_path")
+    title      = context.user_data.get("title")
+    res_key    = context.user_data.get("resolution", "720p")
+    preset     = context.user_data.get("preset", RESOLUTIONS["720p"])
+    orig_size  = context.user_data.get("total_size", 0)
 
-    video_path     = context.user_data.get("video_path")
-    thumbnail_path = context.user_data.get("thumbnail_path")
-    title          = context.user_data.get("title")
-    res_key        = context.user_data.get("resolution", "720p")
-    preset         = context.user_data.get("preset", RESOLUTIONS["720p"])
-    orig_size      = context.user_data.get("total_size", 0)
-
-    h        = preset["h"]
-    w        = preset["w"]
-    crf      = preset["crf"]
-    audio_br = preset["audio"]
+    h, w, crf, audio_br = preset["h"], preset["w"], preset["crf"], preset["audio"]
 
     if not video_path or not Path(video_path).exists():
         await message.reply_text("❌ Video file nahi mili! Dobara bhejein.")
         return WAITING_VIDEO
 
-    user_id     = (update_or_query.effective_user.id
-                   if hasattr(update_or_query, "effective_user")
-                   else update_or_query.from_user.id)
+    user_id     = (src.effective_user.id if hasattr(src, "effective_user")
+                   else src.from_user.id)
     output_path = OUTPUT_DIR / f"{user_id}_{int(time.time())}_{res_key}.mp4"
 
-    # ── Step 1: Get duration ──────────────────────────────────────────────────
+    # Duration
     duration_s = await get_duration(video_path)
 
-    # ── Step 2: Compression status message ───────────────────────────────────
+    # Compression message
     comp_msg = await message.reply_text(
         f"⚙️ *Compression shuru ho rahi hai...*\n\n"
-        f"📐 `{res_key}` ({w}×{h})  CRF `{crf}`\n"
+        f"📐 `{res_key}` ({w}×{h}) | CRF `{crf}`\n"
         f"`[░░░░░░░░░░░░░░░░]` `0%`",
         parse_mode="Markdown",
     )
 
-    # ── Step 3: Build FFmpeg command ──────────────────────────────────────────
     scale = (
         f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
         f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1"
     )
 
-    if thumbnail_path and Path(thumbnail_path).exists():
+    if thumb_path and Path(thumb_path).exists():
         cmd = [
-            "ffmpeg", "-i", video_path, "-i", thumbnail_path,
-            "-vf", scale,
-            "-c:v", "libx264", "-crf", str(crf), "-preset", "ultrafast",
-            "-c:a", "aac", "-b:a", audio_br,
-            "-map", "0:v", "-map", "0:a?", "-map", "1",
-            "-disposition:v:1", "attached_pic",
-            "-movflags", "+faststart", "-y", str(output_path),
-        ]
-    else:
-        cmd = [
-            "ffmpeg", "-i", video_path,
-            "-vf", scale,
-            "-c:v", "libx264", "-crf", str(crf), "-preset", "ultrafast",
-            "-c:a", "aac", "-b:a", audio_br,
-            "-movflags", "+faststart", "-y", str(output_path),
-        ]
-
-    # ── Step 4: Compress ──────────────────────────────────────────────────────
-    rc, stderr_text, comp_elapsed = await compress_with_progress(
-        cmd, duration_s, comp_msg, res_key, crf, audio_br
-    )
-
-    if rc != 0:
-        err_tail = stderr_text[-500:] if stderr_text else "Unknown"
-        await safe_edit(comp_msg,
-            f"❌ *Compression failed!*\n\n```\n{err_tail}\n```"
-        )
-        _cleanup(context)
-        return WAITING_VIDEO
-
-    comp_size = output_path.stat().st_size
-    reduction = (orig_size - comp_size) / orig_size * 100 if orig_size > 0 else 0
-
-    await safe_edit(
-        comp_msg,
-        f"✅ *Compression Complete!*\n\n"
-        f"`[████████████████]` `100%`\n\n"
-        f"📐 Resolution: `{res_key}` ({w}×{h})\n"
-        f"📁 Original:   `{fmt_size(orig_size)}`\n"
-        f"📦 Compressed: `{fmt_size(comp_size)}`\n"
-        f"📉 Saved:      `{reduction:.1f}%`\n"
-        f"⏱️ Time:       `{fmt_time(comp_elapsed)}`",
-    )
-
-    # ── Step 5: Upload ────────────────────────────────────────────────────────
-    upload_msg = await message.reply_text(
-        f"⬆️ *Upload shuru ho raha hai...*\n\n"
-        f"📦 `{fmt_size(comp_size)}`\n"
-        f"`[░░░░░░░░░░░░░░░░]` `0%`",
-        parse_mode="Markdown",
-    )
-
-    caption = title or (
-        f"🎬 *{res_key} Compressed Video*\n"
-        f"📉 `{reduction:.1f}%` size reduced\n"
-        f"📐 `{w}×{h}` | 📦 `{fmt_size(comp_size)}`"
-    )
-
-    try:
-        upload_elapsed = await upload_with_progress(
-            message, output_path, caption,
-            thumbnail_path, upload_msg,
-            res_key, orig_size, comp_size, comp_elapsed,
-        )
-
-        total_elapsed = comp_elapsed + upload_elapsed
-        await safe_edit(
-            upload_msg,
-            f"✅ *Upload Complete!*\n\n"
-            f"`[████████████████]` `100%`\n\n"
-            f"📦 Size:       `{fmt_size(comp_size)}`\n"
-            f"⏱️ Upload time: `{fmt_time(upload_elapsed)}`\n"
-            f"⏱️ Total time:  `{fmt_time(total_elapsed)}`\n\n"
-            f"🎉 *Done! {res_key} video ready hai!*",
-        )
-
-    except Exception as e:
-        logger.error(f"Upload error: {e}", exc_info=True)
-        await safe_edit(upload_msg, f"❌ Upload failed!\n`{e}`")
-
-    finally:
-        _cleanup(context)
-        try:
-            output_path.unlink(missing_ok=True)
-        except Exception:
-            pass
-
-    return WAITING_VIDEO
-
-# ── Cleanup ───────────────────────────────────────────────────────────────────
-
-def _cleanup(context: ContextTypes.DEFAULT_TYPE):
-    for key in ("video_path", "thumbnail_path"):
-        p = context.user_data.pop(key, None)
-        if p:
-            try:
-                Path(p).unlink(missing_ok=True)
-            except Exception:
-                pass
-    for key in ("title", "resolution", "preset", "total_size"):
-        context.user_data.pop(key, None)
-
-# ── main ──────────────────────────────────────────────────────────────────────
-
-def main():
-    if not BOT_TOKEN:
-        logger.error("BOT_TOKEN environment variable set nahi hai!")
-        return
-
-    app = Application.builder().token(BOT_TOKEN).build()
-
-    conv = ConversationHandler(
-        entry_points=[
-            CommandHandler("start", start),
-            MessageHandler(filters.VIDEO | filters.Document.VIDEO, receive_video),
-        ],
-        states={
-            WAITING_VIDEO: [
-                MessageHandler(filters.VIDEO | filters.Document.VIDEO, receive_video),
-            ],
-            WAITING_QUALITY: [
-                CallbackQueryHandler(resolution_callback, pattern="^res_"),
-            ],
-            WAITING_THUMBNAIL: [
-                CallbackQueryHandler(skip_thumbnail, pattern="^skip_thumbnail$"),
-                MessageHandler(filters.PHOTO | filters.Document.IMAGE, receive_thumbnail),
-            ],
-            WAITING_TITLE: [
-                CallbackQueryHandler(skip_title, pattern="^skip_title$"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_title),
-            ],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-        per_user=True,
-        allow_reentry=True,
-    )
-
-    app.add_handler(conv)
-    app.add_handler(CommandHandler("help", help_command))
-    logger.info("✅ Bot polling shuru...")
-    app.run_polling(drop_pending_updates=True)
-
-
-if __name__ == "__main__":
-    main()
+            "ffmpeg", "-i", video_path, "-i", thumb_path,
+            "-vf", scale, "-c:v", "libx264", "-crf", str(crf),
+            "-preset", "ultrafast", "-c:a", "aac", "-b:a", audio_br,
+   
