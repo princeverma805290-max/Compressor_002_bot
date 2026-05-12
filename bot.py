@@ -1,509 +1,476 @@
-"""
-Advanced Telegram Video Compressor Bot
-Library: pyTelegramBotAPI (telebot) — Python 3.14 compatible
-Progress: Download / Compress / Upload
-Resolution: 144p 360p 480p 720p 1080p
-"""
-
-import os, re, time, logging, threading, asyncio
+import os
+import logging
+import asyncio
+import time
 from pathlib import Path
-import requests
-import telebot
-from telebot import types
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler,
+    CallbackQueryHandler, ConversationHandler, filters, ContextTypes
+)
 
-logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
 logger = logging.getLogger(__name__)
 
-# ── Config ────────────────────────────────────────────────────────────────────
-BOT_TOKEN    = os.environ.get("BOT_TOKEN", "")
-OWNER_ID     = int(os.environ.get("OWNER_ID", "0"))
+# States
+WAITING_VIDEO = 1
+WAITING_QUALITY = 2
+WAITING_THUMBNAIL = 3
+WAITING_TITLE = 4
+
+# Resolution presets — height: (width, crf, audio_bitrate, label)
+RESOLUTION_PRESETS = {
+    "144p":  {"height": 144,  "width": 256,  "crf": 40, "audio": "64k",  "label": "📱 144p  — Sabse chhota size"},
+    "360p":  {"height": 360,  "width": 640,  "crf": 36, "audio": "96k",  "label": "📺 360p  — Chhota size"},
+    "480p":  {"height": 480,  "width": 854,  "crf": 32, "audio": "112k", "label": "🖥️ 480p  — Medium quality"},
+    "720p":  {"height": 720,  "width": 1280, "crf": 28, "audio": "128k", "label": "🔵 720p  — HD (Recommended)"},
+    "1080p": {"height": 1080, "width": 1920, "crf": 24, "audio": "192k", "label": "🟣 1080p — Full HD, bada size"},
+}
+
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 DOWNLOAD_DIR = Path("downloads")
-OUTPUT_DIR   = Path("outputs")
+OUTPUT_DIR = Path("outputs")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 OUTPUT_DIR.mkdir(exist_ok=True)
 
-bot = telebot.TeleBot(BOT_TOKEN, parse_mode="Markdown")
 
-# ── Resolutions ───────────────────────────────────────────────────────────────
-RESOLUTIONS = {
-    "144p":  {"h": 144,  "w": 256,  "crf": 40, "audio": "64k",  "emoji": "📱"},
-    "360p":  {"h": 360,  "w": 640,  "crf": 36, "audio": "96k",  "emoji": "📺"},
-    "480p":  {"h": 480,  "w": 854,  "crf": 32, "audio": "112k", "emoji": "🖥️"},
-    "720p":  {"h": 720,  "w": 1280, "crf": 28, "audio": "128k", "emoji": "🔵"},
-    "1080p": {"h": 1080, "w": 1920, "crf": 24, "audio": "192k", "emoji": "🟣"},
-}
+# ─────────────────────────────────────────────
+# /start
+# ─────────────────────────────────────────────
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "🎬 *Video Compressor Bot*\n\n"
+        "Main aapke videos ko compress karta hoon!\n\n"
+        "📌 *Features:*\n"
+        "• Resolution select: 144p / 360p / 480p / 720p / 1080p\n"
+        "• Custom Thumbnail set karein\n"
+        "• Custom Title / Caption add karein\n"
+        "• Fast FFmpeg compression\n\n"
+        "🚀 *Shuru karne ke liye video bhejein!*\n\n"
+        "/help — Help\n"
+        "/cancel — Cancel",
+        parse_mode="Markdown"
+    )
+    return WAITING_VIDEO
 
-# ── User state storage ────────────────────────────────────────────────────────
-user_data = {}
 
-def get_ud(uid):
-    if uid not in user_data:
-        user_data[uid] = {}
-    return user_data[uid]
+# ─────────────────────────────────────────────
+# /help
+# ─────────────────────────────────────────────
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📖 *Help Guide*\n\n"
+        "1️⃣ Video bhejein bot ko\n"
+        "2️⃣ Resolution select karein (144p – 1080p)\n"
+        "3️⃣ Thumbnail bhejein (optional)\n"
+        "4️⃣ Title likhein (optional)\n"
+        "5️⃣ Compressed video milega!\n\n"
+        "⚠️ *Note:* Max 2GB video support hai\n\n"
+        "*Resolution Guide:*\n"
+        "📱 144p — WhatsApp forward ke liye\n"
+        "📺 360p — Normal viewing\n"
+        "🖥️ 480p — SD quality\n"
+        "🔵 720p — HD (best balance)\n"
+        "🟣 1080p — Full HD",
+        parse_mode="Markdown"
+    )
 
-def clear_ud(uid):
-    for k in ("video_path", "thumbnail_path"):
-        p = user_data.get(uid, {}).pop(k, None)
-        if p:
-            try: Path(p).unlink(missing_ok=True)
-            except: pass
-    user_data.pop(uid, None)
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-def make_bar(pct, w=16):
-    f = int(w * min(pct, 100) / 100)
-    return "█" * f + "░" * (w - f)
+# ─────────────────────────────────────────────
+# /cancel
+# ─────────────────────────────────────────────
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _cleanup_user_files(context)
+    await update.message.reply_text("❌ Task cancel kar diya gaya!")
+    return WAITING_VIDEO
 
-def fmt_size(b):
-    b = int(b)
-    if b < 1024:    return f"{b} B"
-    if b < 1<<20:   return f"{b/1024:.1f} KB"
-    if b < 1<<30:   return f"{b/(1<<20):.1f} MB"
-    return f"{b/(1<<30):.2f} GB"
 
-def fmt_time(s):
-    s = int(max(0, s))
-    if s < 60:   return f"{s}s"
-    if s < 3600: return f"{s//60}m {s%60:02d}s"
-    return f"{s//3600}h {(s%3600)//60:02d}m"
+# ─────────────────────────────────────────────
+# Video receive
+# ─────────────────────────────────────────────
+async def receive_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+    video = message.video or message.document
 
-def fmt_speed(bps):
-    if bps < 1024:  return f"{bps:.0f} B/s"
-    if bps < 1<<20: return f"{bps/1024:.1f} KB/s"
-    return f"{bps/(1<<20):.1f} MB/s"
+    if not video:
+        await message.reply_text("❗ Koi video nahi mila. Sirf video files bhejein!")
+        return WAITING_VIDEO
 
-def safe_edit(msg, text):
+    if video.file_size and video.file_size > 2 * 1024 * 1024 * 1024:
+        await message.reply_text("❗ File bohot badi hai! Max 2GB allowed hai.")
+        return WAITING_VIDEO
+
+    status_msg = await message.reply_text("⬇️ Video download ho raha hai...")
+
     try:
-        bot.edit_message_text(text, msg.chat.id, msg.message_id, parse_mode="Markdown")
-    except Exception:
-        pass
+        file = await context.bot.get_file(video.file_id)
+        user_id = update.effective_user.id
 
-def is_owner(uid):
-    return OWNER_ID == 0 or uid == OWNER_ID
+        if message.video:
+            ext = ".mp4"
+        else:
+            fname = getattr(video, 'file_name', None) or "video.mp4"
+            ext = Path(fname).suffix or ".mp4"
 
-def res_keyboard():
-    kb = types.InlineKeyboardMarkup()
-    kb.add(types.InlineKeyboardButton("📱 144p  — Sabse chhota", callback_data="res_144p"))
-    kb.add(types.InlineKeyboardButton("📺 360p  — Chhota size",  callback_data="res_360p"))
-    kb.add(types.InlineKeyboardButton("🖥️ 480p  — Medium SD",    callback_data="res_480p"))
-    kb.add(types.InlineKeyboardButton("🔵 720p  — HD ✅",         callback_data="res_720p"))
-    kb.add(types.InlineKeyboardButton("🟣 1080p — Full HD",       callback_data="res_1080p"))
-    return kb
+        video_path = DOWNLOAD_DIR / f"{user_id}_{int(time.time())}_input{ext}"
+        await file.download_to_drive(str(video_path))
 
-def skip_kb(cb_data, label):
-    kb = types.InlineKeyboardMarkup()
-    kb.add(types.InlineKeyboardButton(f"⏭️ Skip {label}", callback_data=cb_data))
-    return kb
+        context.user_data['video_path'] = str(video_path)
+        context.user_data['thumbnail_path'] = None
+        context.user_data['title'] = None
 
-# ── Download with progress ────────────────────────────────────────────────────
-def download_with_progress(file_id, dest, status_msg, total_size):
-    file_info = bot.get_file(file_id)
-    url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_info.file_path}"
-    CHUNK = 512 * 1024
-    UPD   = 2.0
-    start = last = time.time()
-    done  = 0
+        file_size_str = format_size(video.file_size) if video.file_size else "Unknown"
+        await status_msg.edit_text(f"✅ Video download ho gaya! ({file_size_str})")
 
-    with requests.get(url, stream=True) as r:
-        r.raise_for_status()
-        if not total_size:
-            total_size = int(r.headers.get("Content-Length", 0))
-        with open(dest, "wb") as f:
-            for chunk in r.iter_content(CHUNK):
-                if not chunk: continue
-                f.write(chunk)
-                done += len(chunk)
-                now = time.time()
-                if now - last >= UPD:
-                    el  = now - start
-                    sp  = done / el if el else 0
-                    pct = min(done / total_size * 100, 99) if total_size else 0
-                    eta = (total_size - done) / sp if sp and total_size else 0
-                    safe_edit(status_msg,
-                        f"⬇️ *Downloading Video*\n\n"
-                        f"`[{make_bar(pct)}]` `{pct:.1f}%`\n\n"
-                        f"📥 `{fmt_size(done)}`" +
-                        (f" / `{fmt_size(total_size)}`" if total_size else "") +
-                        f"\n⚡ Speed:   `{fmt_speed(sp)}`\n"
-                        f"⏱️ Elapsed: `{fmt_time(el)}`\n"
-                        f"⏳ ETA:     `{fmt_time(eta)}`"
-                    )
-                    last = now
+        # Show resolution buttons
+        keyboard = [
+            [InlineKeyboardButton("📱 144p  — Sabse chhota",  callback_data="res_144p")],
+            [InlineKeyboardButton("📺 360p  — Chhota size",   callback_data="res_360p")],
+            [InlineKeyboardButton("🖥️ 480p  — Medium",        callback_data="res_480p")],
+            [InlineKeyboardButton("🔵 720p  — HD ✅",          callback_data="res_720p")],
+            [InlineKeyboardButton("🟣 1080p — Full HD",        callback_data="res_1080p")],
+        ]
 
-    elapsed = time.time() - start
-    return elapsed, done
+        await message.reply_text(
+            "🎚️ *Resolution select karein:*\n\n"
+            "📱 *144p* — Sabse chhota file, basic use\n"
+            "📺 *360p* — Chhota size, acceptable quality\n"
+            "🖥️ *480p* — SD quality, balanced\n"
+            "🔵 *720p* — HD quality *(Recommended)*\n"
+            "🟣 *1080p* — Full HD, best quality\n\n"
+            "⚠️ Original se badi resolution select nahi hogi",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return WAITING_QUALITY
 
-# ── Get duration ──────────────────────────────────────────────────────────────
-def get_duration(path):
+    except Exception as e:
+        logger.error(f"Download error: {e}")
+        await status_msg.edit_text(f"❌ Download failed: {str(e)}")
+        return WAITING_VIDEO
+
+
+# ─────────────────────────────────────────────
+# Resolution callback
+# ─────────────────────────────────────────────
+async def resolution_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    res_key = query.data.replace("res_", "")          # e.g. "720p"
+    preset = RESOLUTION_PRESETS[res_key]
+
+    context.user_data['resolution'] = res_key
+    context.user_data['res_preset'] = preset
+
+    await query.edit_message_text(
+        f"✅ Resolution set: *{res_key}* — {preset['label']}",
+        parse_mode="Markdown"
+    )
+
+    keyboard = [[InlineKeyboardButton("⏭️ Skip", callback_data="skip_thumbnail")]]
+    await query.message.reply_text(
+        "🖼️ *Thumbnail bhejein* (optional)\n\n"
+        "Compressed video ke liye thumbnail image bhejein\n"
+        "Ya skip karein:",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return WAITING_THUMBNAIL
+
+
+# ─────────────────────────────────────────────
+# Thumbnail receive
+# ─────────────────────────────────────────────
+async def receive_thumbnail(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+
+    if not (message.photo or (message.document and message.document.mime_type and
+                               message.document.mime_type.startswith("image/"))):
+        await message.reply_text("❗ Image nahi mila. Photo bhejein ya skip karein!")
+        return WAITING_THUMBNAIL
+
+    status_msg = await message.reply_text("⬇️ Thumbnail download ho raha hai...")
+
     try:
-        import subprocess
-        r = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-             "-of", "default=noprint_wrappers=1:nokey=1", path],
-            capture_output=True, text=True)
-        return float(r.stdout.strip())
-    except: return 0.0
+        file_obj = message.photo[-1] if message.photo else message.document
+        file = await context.bot.get_file(file_obj.file_id)
+        user_id = update.effective_user.id
+        thumb_path = DOWNLOAD_DIR / f"{user_id}_{int(time.time())}_thumb.jpg"
+        await file.download_to_drive(str(thumb_path))
+        context.user_data['thumbnail_path'] = str(thumb_path)
+        await status_msg.edit_text("✅ Thumbnail set ho gaya!")
+    except Exception as e:
+        await status_msg.edit_text(f"⚠️ Thumbnail failed, skip kar raha hoon: {e}")
+        context.user_data['thumbnail_path'] = None
 
-# ── Compress with progress ────────────────────────────────────────────────────
-def compress_with_progress(cmd, dur, status_msg, res_key, crf, audio_br):
-    import subprocess
-    start  = time.time()
-    buf    = []
-    cur = fps = spd = 0.0
-    brate  = ""
+    keyboard = [[InlineKeyboardButton("⏭️ Skip", callback_data="skip_title")]]
+    await message.reply_text(
+        "✏️ *Title / Caption likhein* (optional)\n\n"
+        "Compressed video ke saath bheja jayega\n"
+        "Ya skip karein:",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return WAITING_TITLE
 
-    proc = subprocess.Popen(cmd, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL,
-                            universal_newlines=True)
-    last_upd = start
 
-    for line in proc.stderr:
-        line = line.strip()
-        buf.append(line)
-        m = re.search(r"time=(\d+):(\d+):(\d+\.\d+)", line)
-        if m: h,mi,s = m.groups(); cur = int(h)*3600+int(mi)*60+float(s)
-        m = re.search(r"fps=\s*([\d.]+)", line)
-        if m: fps = float(m.group(1))
-        m = re.search(r"speed=\s*([\d.]+)x", line)
-        if m: spd = float(m.group(1))
-        m = re.search(r"bitrate=\s*([\d.]+\s*\S+bits/s)", line)
-        if m: brate = m.group(1).strip()
+async def skip_thumbnail(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data['thumbnail_path'] = None
+    await query.edit_message_text("⏭️ Thumbnail skip kar diya!")
 
-        now = time.time()
-        if now - last_upd >= 3:
-            el  = now - start
-            pct = min(cur / dur * 100, 99) if dur else 0
-            eta = (dur - cur) / spd if spd and dur else 0
-            safe_edit(status_msg,
-                f"⚙️ *Compressing — {res_key}*\n\n"
-                f"`[{make_bar(pct)}]` `{pct:.1f}%`\n\n"
-                f"🎞️ Processed: `{fmt_time(cur)}` / `{fmt_time(dur)}`\n"
-                f"🔢 FPS:       `{fps:.1f}`\n"
-                f"⚡ Speed:    `{spd:.2f}x realtime`\n"
-                f"📡 Bitrate:  `{brate or '—'}`\n"
-                f"⏱️ Elapsed:  `{fmt_time(el)}`\n"
-                f"⏳ ETA:      `{fmt_time(eta)}`\n\n"
-                f"CRF `{crf}` | Audio `{audio_br}`"
-            )
-            last_upd = now
+    keyboard = [[InlineKeyboardButton("⏭️ Skip", callback_data="skip_title")]]
+    await query.message.reply_text(
+        "✏️ *Title / Caption likhein* (optional)\n\n"
+        "Compressed video ke saath bheja jayega\n"
+        "Ya skip karein:",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return WAITING_TITLE
 
-    proc.wait()
-    return proc.returncode, "\n".join(buf), time.time() - start
 
-# ── Upload with progress ──────────────────────────────────────────────────────
-def upload_with_progress(chat_id, output_path, caption, thumb_path,
-                          status_msg, res_key, orig_size, comp_size, reply_to):
-    fsz       = output_path.stat().st_size
-    start     = time.time()
-    done_flag = threading.Event()
-    err       = [None]
-    reduction = (orig_size - comp_size) / orig_size * 100 if orig_size else 0
-    SPEED     = 1.2 * (1 << 20)
+# ─────────────────────────────────────────────
+# Title receive
+# ─────────────────────────────────────────────
+async def receive_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['title'] = update.message.text.strip()
+    await update.message.reply_text(f"✅ Title set: _{context.user_data['title']}_",
+                                    parse_mode="Markdown")
+    return await start_compression(update, context)
 
-    def do_upload():
-        try:
-            with open(str(output_path), "rb") as vf:
-                thumb_f = open(thumb_path, "rb") if thumb_path and Path(thumb_path).exists() else None
-                bot.send_video(
-                    chat_id, vf,
-                    caption=caption,
-                    thumbnail=thumb_f,
-                    supports_streaming=True,
-                    parse_mode="Markdown",
-                    reply_to_message_id=reply_to,
-                )
-                if thumb_f: thumb_f.close()
-        except Exception as e:
-            err[0] = e
-        finally:
-            done_flag.set()
 
-    t = threading.Thread(target=do_upload, daemon=True)
-    t.start()
+async def skip_title(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data['title'] = None
+    await query.edit_message_text("⏭️ Title skip kar diya!")
+    return await start_compression(query, context)
 
-    while not done_flag.is_set():
-        time.sleep(2)
-        if done_flag.is_set(): break
-        el  = time.time() - start
-        est = min(el * SPEED, fsz * 0.97)
-        pct = min(est / fsz * 100, 97) if fsz else 50
-        sp  = est / el if el else SPEED
-        eta = (fsz - est) / sp if sp else 0
-        safe_edit(status_msg,
-            f"⬆️ *Uploading — {res_key}*\n\n"
-            f"`[{make_bar(pct)}]` `{pct:.1f}%`\n\n"
-            f"📦 Size:     `{fmt_size(fsz)}`\n"
-            f"⚡ Speed:   `~{fmt_speed(sp)}`\n"
-            f"⏱️ Elapsed: `{fmt_time(el)}`\n"
-            f"⏳ ETA:     `~{fmt_time(eta)}`\n\n"
-            f"📉 Saved `{reduction:.1f}%`"
+
+# ─────────────────────────────────────────────
+# Compression
+# ─────────────────────────────────────────────
+async def start_compression(update_or_query, context: ContextTypes.DEFAULT_TYPE):
+    message = update_or_query.message
+
+    video_path     = context.user_data.get('video_path')
+    thumbnail_path = context.user_data.get('thumbnail_path')
+    title          = context.user_data.get('title')
+    res_key        = context.user_data.get('resolution', '720p')
+    preset         = context.user_data.get('res_preset', RESOLUTION_PRESETS['720p'])
+
+    height      = preset['height']
+    width       = preset['width']
+    crf         = preset['crf']
+    audio_br    = preset['audio']
+
+    if not video_path or not Path(video_path).exists():
+        await message.reply_text("❌ Video file nahi mili! Dobara bhejein.")
+        return WAITING_VIDEO
+
+    user_id = (update_or_query.effective_user.id
+               if hasattr(update_or_query, 'effective_user')
+               else update_or_query.from_user.id)
+
+    status_msg = await message.reply_text(
+        f"🔄 *Compression shuru ho rahi hai...*\n\n"
+        f"📐 Resolution: *{res_key}* ({width}×{height})\n"
+        f"⚙️ CRF: {crf} | Audio: {audio_br}\n"
+        f"⏳ Thoda wait karein...",
+        parse_mode="Markdown"
+    )
+
+    output_path = OUTPUT_DIR / f"{user_id}_{int(time.time())}_{res_key}.mp4"
+
+    try:
+        # scale filter — keep aspect ratio, pad if needed, force even dimensions
+        scale_filter = (
+            f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,"
+            f"setsar=1"
         )
 
-    t.join()
-    if err[0]: raise err[0]
-    return time.time() - start
+        # Base FFmpeg command
+        cmd = [
+            "ffmpeg", "-i", video_path,
+            "-vf", scale_filter,
+            "-c:v", "libx264",
+            "-crf", str(crf),
+            "-preset", "ultrafast",   # Render free CPU ke liye
+            "-c:a", "aac",
+            "-b:a", audio_br,
+            "-movflags", "+faststart",
+            "-y",
+        ]
 
-# ── Pipeline ──────────────────────────────────────────────────────────────────
-def run_pipeline(message, uid):
-    ud        = get_ud(uid)
-    vpath     = ud.get("video_path")
-    tpath     = ud.get("thumbnail_path")
-    title     = ud.get("title")
-    res_key   = ud.get("resolution", "720p")
-    preset    = ud.get("preset", RESOLUTIONS["720p"])
-    orig_size = ud.get("total_size", 0)
-    h, w, crf, abr = preset["h"], preset["w"], preset["crf"], preset["audio"]
+        # Thumbnail embed
+        if thumbnail_path and Path(thumbnail_path).exists():
+            cmd = [
+                "ffmpeg",
+                "-i", video_path,
+                "-i", thumbnail_path,
+                "-vf", scale_filter,
+                "-c:v", "libx264",
+                "-crf", str(crf),
+                "-preset", "ultrafast",
+                "-c:a", "aac",
+                "-b:a", audio_br,
+                "-map", "0:v",
+                "-map", "0:a?",
+                "-map", "1",
+                "-disposition:v:1", "attached_pic",
+                "-movflags", "+faststart",
+                "-y",
+            ]
 
-    if not vpath or not Path(vpath).exists():
-        bot.send_message(message.chat.id, "❌ Video nahi mili! Dobara bhejein.")
-        return
+        cmd.append(str(output_path))
 
-    outp = OUTPUT_DIR / f"{uid}_{int(time.time())}_{res_key}.mp4"
-    dur  = get_duration(vpath)
+        start_time = time.time()
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await process.communicate()
+        elapsed = time.time() - start_time
 
-    # Compress status
-    cmsg = bot.send_message(message.chat.id,
-        f"⚙️ *Compression shuru...*\n\n📐 `{res_key}` ({w}×{h}) | CRF `{crf}`\n"
-        f"`[░░░░░░░░░░░░░░░░]` `0%`", parse_mode="Markdown")
+        if process.returncode != 0:
+            err = stderr.decode(errors='replace')[-600:] if stderr else "Unknown"
+            await status_msg.edit_text(
+                f"❌ *Compression failed!*\n\n```{err}```",
+                parse_mode="Markdown"
+            )
+            return WAITING_VIDEO
 
-    scale = (f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
-             f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1")
+        original_size   = Path(video_path).stat().st_size
+        compressed_size = output_path.stat().st_size
+        reduction = ((original_size - compressed_size) / original_size * 100
+                     if original_size > 0 else 0)
 
-    if tpath and Path(tpath).exists():
-        cmd = ["ffmpeg", "-i", vpath, "-i", tpath, "-vf", scale,
-               "-c:v", "libx264", "-crf", str(crf), "-preset", "ultrafast",
-               "-c:a", "aac", "-b:a", abr,
-               "-map", "0:v", "-map", "0:a?", "-map", "1",
-               "-disposition:v:1", "attached_pic",
-               "-movflags", "+faststart", "-y", str(outp)]
-    else:
-        cmd = ["ffmpeg", "-i", vpath, "-vf", scale,
-               "-c:v", "libx264", "-crf", str(crf), "-preset", "ultrafast",
-               "-c:a", "aac", "-b:a", abr,
-               "-movflags", "+faststart", "-y", str(outp)]
+        await status_msg.edit_text(
+            f"✅ *Compression complete!*\n\n"
+            f"📐 Resolution: *{res_key}* ({width}×{height})\n"
+            f"📁 Original:   {format_size(original_size)}\n"
+            f"📦 Compressed: {format_size(compressed_size)}\n"
+            f"📉 Reduction:  {reduction:.1f}%\n"
+            f"⏱️ Time:       {elapsed:.1f}s\n\n"
+            f"⬆️ Upload ho raha hai...",
+            parse_mode="Markdown"
+        )
 
-    rc, stderr, celapsed = compress_with_progress(cmd, dur, cmsg, res_key, crf, abr)
+        caption = title or (
+            f"🎬 *{res_key} Compressed Video*\n"
+            f"📉 Size reduced by {reduction:.1f}%\n"
+            f"📐 {width}×{height}"
+        )
 
-    if rc != 0:
-        safe_edit(cmsg, f"❌ *Compression failed!*\n\n```\n{stderr[-400:]}\n```")
-        clear_ud(uid); return
+        with open(str(output_path), 'rb') as vf:
+            if thumbnail_path and Path(thumbnail_path).exists():
+                with open(thumbnail_path, 'rb') as tf:
+                    await message.reply_video(
+                        video=vf, caption=caption,
+                        thumbnail=tf, supports_streaming=True,
+                        parse_mode="Markdown"
+                    )
+            else:
+                await message.reply_video(
+                    video=vf, caption=caption,
+                    supports_streaming=True, parse_mode="Markdown"
+                )
 
-    csz       = outp.stat().st_size
-    reduction = (orig_size - csz) / orig_size * 100 if orig_size else 0
-    safe_edit(cmsg,
-        f"✅ *Compression Complete!*\n\n"
-        f"`[████████████████]` `100%`\n\n"
-        f"📐 `{res_key}` ({w}×{h})\n"
-        f"📁 Original:   `{fmt_size(orig_size)}`\n"
-        f"📦 Compressed: `{fmt_size(csz)}`\n"
-        f"📉 Saved:      `{reduction:.1f}%`\n"
-        f"⏱️ Time:       `{fmt_time(celapsed)}`")
+        await status_msg.edit_text(
+            f"✅ *Done! {res_key} video ready hai!* 🎉",
+            parse_mode="Markdown"
+        )
 
-    # Upload status
-    umsg = bot.send_message(message.chat.id,
-        f"⬆️ *Upload shuru...*\n\n📦 `{fmt_size(csz)}`\n"
-        f"`[░░░░░░░░░░░░░░░░]` `0%`", parse_mode="Markdown")
-
-    caption = title or (f"🎬 *{res_key} Compressed*\n"
-                        f"📉 `{reduction:.1f}%` reduced | 📐 `{w}×{h}` | 📦 `{fmt_size(csz)}`")
-    try:
-        uel = upload_with_progress(
-            message.chat.id, outp, caption, tpath, umsg,
-            res_key, orig_size, csz, message.message_id)
-        safe_edit(umsg,
-            f"✅ *Upload Complete!*\n\n"
-            f"`[████████████████]` `100%`\n\n"
-            f"📦 `{fmt_size(csz)}`\n"
-            f"⏱️ Upload: `{fmt_time(uel)}`\n"
-            f"⏱️ Total:  `{fmt_time(celapsed + uel)}`\n\n"
-            f"🎉 *Done! {res_key} video ready!*")
     except Exception as e:
-        logger.error(f"Upload error: {e}", exc_info=True)
-        safe_edit(umsg, f"❌ Upload failed!\n`{e}`")
+        logger.error(f"Compression error: {e}")
+        await status_msg.edit_text(f"❌ Error: {str(e)}")
+
     finally:
-        clear_ud(uid)
-        try: outp.unlink(missing_ok=True)
-        except: pass
-
-# ── Handlers ──────────────────────────────────────────────────────────────────
-
-@bot.message_handler(commands=["start"])
-def cmd_start(msg):
-    if not is_owner(msg.from_user.id):
-        bot.reply_to(msg, "❌ Unauthorized!"); return
-    bot.reply_to(msg,
-        f"👋 Welcome *{msg.from_user.first_name}*!\n\n"
-        "🎬 *Advanced Video Compressor Bot*\n\n"
-        "⬇️ Download → ⚙️ Compress → ⬆️ Upload\n"
-        "Har step ka real-time progress bar!\n\n"
-        "📐 *Resolutions:* 144p / 360p / 480p / 720p / 1080p\n"
-        "🖼️ Thumbnail | ✏️ Title | 🔐 Owner only\n\n"
-        "📤 *Video bhejein shuru karne ke liye!*\n"
-        "/help | /cancel")
-
-@bot.message_handler(commands=["help"])
-def cmd_help(msg):
-    if not is_owner(msg.from_user.id): return
-    bot.reply_to(msg,
-        "📖 *Help*\n\n"
-        "1️⃣ Video bhejein (max 2GB)\n"
-        "2️⃣ Resolution choose karein\n"
-        "3️⃣ Thumbnail ya skip\n"
-        "4️⃣ Title ya skip\n"
-        "5️⃣ Progress bars dekhein!\n\n"
-        "📱 144p | 📺 360p | 🖥️ 480p | 🔵 720p | 🟣 1080p")
-
-@bot.message_handler(commands=["cancel"])
-def cmd_cancel(msg):
-    clear_ud(msg.from_user.id)
-    bot.reply_to(msg, "❌ Cancel kar diya!")
-
-@bot.message_handler(content_types=["video", "document"])
-def handle_video(msg):
-    uid = msg.from_user.id
-    if not is_owner(uid):
-        bot.reply_to(msg, "❌ Unauthorized!"); return
-
-    video = msg.video or msg.document
-    if not video:
-        bot.reply_to(msg, "❗ Sirf video bhejein!"); return
-
-    # Check mime for document
-    if msg.document:
-        mime = getattr(msg.document, "mime_type", "") or ""
-        if not mime.startswith("video/"):
-            bot.reply_to(msg, "❗ Sirf video files bhejein!"); return
-
-    total = getattr(video, "file_size", 0) or 0
-    if total > 2 * (1 << 30):
-        bot.reply_to(msg, "❗ Max 2GB!"); return
-
-    st = bot.reply_to(msg,
-        f"⬇️ *Download shuru...*\n\n📁 `{fmt_size(total)}`\n"
-        f"`[░░░░░░░░░░░░░░░░]` `0%`")
-
-    ext  = ".mp4"
-    if msg.document:
-        fname = getattr(video, "file_name", None) or "video.mp4"
-        ext   = Path(fname).suffix or ".mp4"
-    dest = DOWNLOAD_DIR / f"{uid}_{int(time.time())}_input{ext}"
-
-    def do_download():
+        _cleanup_user_files(context)
         try:
-            elapsed, dl = download_with_progress(video.file_id, dest, st, total)
-            sp = dl / elapsed if elapsed else 0
-            safe_edit(st,
-                f"✅ *Download Complete!*\n\n"
-                f"`[████████████████]` `100%`\n\n"
-                f"📥 `{fmt_size(dl)}`\n"
-                f"⚡ Avg Speed: `{fmt_speed(sp)}`\n"
-                f"⏱️ Time: `{fmt_time(elapsed)}`")
+            output_path.unlink(missing_ok=True)
+        except Exception:
+            pass
 
-            ud = get_ud(uid)
-            ud.update({"video_path": str(dest), "thumbnail_path": None,
-                       "title": None, "total_size": dl, "last_msg": msg})
+    return WAITING_VIDEO
 
-            bot.send_message(msg.chat.id,
-                "🎚️ *Resolution select karein:*\n\n"
-                "📱 *144p* — Sabse chhota\n📺 *360p* — Chhota\n"
-                "🖥️ *480p* — SD\n🔵 *720p* — HD *(Best)*\n🟣 *1080p* — Full HD",
-                parse_mode="Markdown", reply_markup=res_keyboard())
-        except Exception as e:
-            logger.error(f"Download error: {e}", exc_info=True)
-            safe_edit(st, f"❌ Download failed!\n`{e}`")
 
-    threading.Thread(target=do_download, daemon=True).start()
+# ─────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────
+def _cleanup_user_files(context: ContextTypes.DEFAULT_TYPE):
+    for key in ('video_path', 'thumbnail_path'):
+        path = context.user_data.pop(key, None)
+        if path:
+            try:
+                Path(path).unlink(missing_ok=True)
+            except Exception:
+                pass
+    for key in ('title', 'resolution', 'res_preset'):
+        context.user_data.pop(key, None)
 
-@bot.callback_query_handler(func=lambda c: c.data.startswith("res_"))
-def cb_resolution(call):
-    uid     = call.from_user.id
-    res_key = call.data.replace("res_", "")
-    preset  = RESOLUTIONS[res_key]
-    ud      = get_ud(uid)
-    ud["resolution"] = res_key
-    ud["preset"]     = preset
-    bot.answer_callback_query(call.id)
-    bot.edit_message_text(
-        f"✅ *Resolution:* `{res_key}` {preset['emoji']} `{preset['w']}×{preset['h']}` | CRF `{preset['crf']}`",
-        call.message.chat.id, call.message.message_id, parse_mode="Markdown")
-    bot.send_message(call.message.chat.id,
-        "🖼️ *Thumbnail* (optional)\nImage bhejein ya skip:",
-        parse_mode="Markdown", reply_markup=skip_kb("skip_thumbnail", "Thumbnail"))
 
-@bot.callback_query_handler(func=lambda c: c.data == "skip_thumbnail")
-def cb_skip_thumb(call):
-    uid = call.from_user.id
-    get_ud(uid)["thumbnail_path"] = None
-    bot.answer_callback_query(call.id)
-    bot.edit_message_text("⏭️ Thumbnail skip!", call.message.chat.id, call.message.message_id)
-    bot.send_message(call.message.chat.id,
-        "✏️ *Title* (optional)\nText likhein ya skip:",
-        parse_mode="Markdown", reply_markup=skip_kb("skip_title", "Title"))
+def format_size(size_bytes):
+    if size_bytes < 1024:
+        return f"{size_bytes} B"
+    elif size_bytes < 1024 ** 2:
+        return f"{size_bytes/1024:.1f} KB"
+    elif size_bytes < 1024 ** 3:
+        return f"{size_bytes/1024**2:.1f} MB"
+    else:
+        return f"{size_bytes/1024**3:.2f} GB"
 
-@bot.message_handler(content_types=["photo"])
-def handle_thumbnail(msg):
-    uid = msg.from_user.id
-    ud  = get_ud(uid)
-    if "resolution" not in ud or "thumbnail_path" not in ud:
-        return
-    if ud.get("thumbnail_path") is not None:
-        return  # already set
 
-    st = bot.reply_to(msg, "⬇️ Thumbnail download...")
-    try:
-        fobj = msg.photo[-1]
-        fi   = bot.get_file(fobj.file_id)
-        url  = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{fi.file_path}"
-        path = DOWNLOAD_DIR / f"{uid}_{int(time.time())}_thumb.jpg"
-        r    = requests.get(url)
-        path.write_bytes(r.content)
-        ud["thumbnail_path"] = str(path)
-        safe_edit(st, "✅ Thumbnail set!")
-        bot.send_message(msg.chat.id,
-            "✏️ *Title* (optional)\nText likhein ya skip:",
-            parse_mode="Markdown", reply_markup=skip_kb("skip_title", "Title"))
-    except Exception as e:
-        ud["thumbnail_path"] = None
-        safe_edit(st, f"⚠️ Thumbnail skip (error: {e})")
-        bot.send_message(msg.chat.id,
-            "✏️ *Title* (optional)\nText likhein ya skip:",
-            parse_mode="Markdown", reply_markup=skip_kb("skip_title", "Title"))
-
-@bot.callback_query_handler(func=lambda c: c.data == "skip_title")
-def cb_skip_title(call):
-    uid = call.from_user.id
-    ud  = get_ud(uid)
-    ud["title"] = None
-    bot.answer_callback_query(call.id)
-    bot.edit_message_text("⏭️ Title skip!", call.message.chat.id, call.message.message_id)
-    msg = ud.get("last_msg", call.message)
-    threading.Thread(target=run_pipeline, args=(msg, uid), daemon=True).start()
-
-@bot.message_handler(content_types=["text"])
-def handle_title(msg):
-    uid = msg.from_user.id
-    ud  = get_ud(uid)
-    if "resolution" not in ud:
-        return
-    if ud.get("title") is not None or ud.get("thumbnail_path") is None:
-        # Only accept title if we're in title-waiting state
-        if "video_path" not in ud: return
-        if ud.get("title") is not None: return
-
-    text = msg.text.strip()
-    if text.startswith("/"): return
-    ud["title"] = text
-    bot.reply_to(msg, f"✅ Title: _{text}_", parse_mode="Markdown")
-    src = ud.get("last_msg", msg)
-    threading.Thread(target=run_pipeline, args=(src, uid), daemon=True).start()
-
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────
 def main():
     if not BOT_TOKEN:
-        logger.error("BOT_TOKEN set nahi!"); return
-    logger.info(f"Owner ID: {OWNER_ID if OWNER_ID else 'Not set (open)'}")
-    logger.info("✅ Bot polling shuru (pyTelegramBotAPI)...")
-    bot.infinity_polling(timeout=60, long_polling_timeout=30)
+        logger.error("BOT_TOKEN environment variable nahi mila!")
+        return
+
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    conv_handler = ConversationHandler(
+        entry_points=[
+            CommandHandler("start", start),
+            MessageHandler(filters.VIDEO | filters.Document.VIDEO, receive_video),
+        ],
+        states={
+            WAITING_VIDEO: [
+                MessageHandler(filters.VIDEO | filters.Document.VIDEO, receive_video),
+            ],
+            WAITING_QUALITY: [
+                CallbackQueryHandler(resolution_callback, pattern="^res_"),
+            ],
+            WAITING_THUMBNAIL: [
+                CallbackQueryHandler(skip_thumbnail, pattern="^skip_thumbnail$"),
+                MessageHandler(filters.PHOTO | filters.Document.IMAGE, receive_thumbnail),
+            ],
+            WAITING_TITLE: [
+                CallbackQueryHandler(skip_title, pattern="^skip_title$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_title),
+            ],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+        per_user=True,
+        allow_reentry=True,
+    )
+
+    app.add_handler(conv_handler)
+    app.add_handler(CommandHandler("help", help_command))
+
+    logger.info("✅ Bot start ho raha hai...")
+    app.run_polling(drop_pending_updates=True)
+
 
 if __name__ == "__main__":
     main()
-            
