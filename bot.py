@@ -1,8 +1,9 @@
 """
 Advanced Telegram Video Compressor Bot
-Library: pyTelegramBotAPI (telebot) — Python 3.14 compatible
-Progress: Download / Compress / Upload
-Resolution: 144p 360p 480p 720p 1080p
+- Telethon (no file size limit - 1GB+)
+- pyTelegramBotAPI for commands/UI
+- Progress: Download / Compress / Upload
+- Resolution: 144p 360p 480p 720p 1080p
 """
 
 import os, re, time, logging, threading, asyncio
@@ -10,18 +11,26 @@ from pathlib import Path
 import requests
 import telebot
 from telebot import types
+from telethon import TelegramClient
+from telethon.tl.types import DocumentAttributeVideo
 
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# ── Config ────────────────────────────────────────────────────────────────────
 BOT_TOKEN    = os.environ.get("BOT_TOKEN", "")
 OWNER_ID     = int(os.environ.get("OWNER_ID", "0"))
+API_ID       = int(os.environ.get("API_ID", "0"))
+API_HASH     = os.environ.get("API_HASH", "")
 DOWNLOAD_DIR = Path("downloads")
 OUTPUT_DIR   = Path("outputs")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 OUTPUT_DIR.mkdir(exist_ok=True)
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="Markdown")
+
+# Telethon client (bot login)
+tg_client = TelegramClient("bot_session", API_ID, API_HASH)
 
 RESOLUTIONS = {
     "144p":  {"h": 144,  "w": 256,  "crf": 40, "audio": "64k",  "emoji": "📱"},
@@ -46,6 +55,7 @@ def clear_ud(uid):
             except: pass
     user_data.pop(uid, None)
 
+# ── Helpers ───────────────────────────────────────────────────────────────────
 def make_bar(pct, w=16):
     f = int(w * min(pct, 100) / 100)
     return "█" * f + "░" * (w - f)
@@ -91,40 +101,47 @@ def skip_kb(cb_data, label):
     kb.add(types.InlineKeyboardButton(f"⏭️ Skip {label}", callback_data=cb_data))
     return kb
 
-def download_with_progress(file_id, dest, status_msg, total_size):
-    file_info = bot.get_file(file_id)
-    url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_info.file_path}"
-    CHUNK = 512 * 1024
-    UPD   = 2.0
-    start = last = time.time()
-    done  = 0
-    with requests.get(url, stream=True) as r:
-        r.raise_for_status()
-        if not total_size:
-            total_size = int(r.headers.get("Content-Length", 0))
-        with open(dest, "wb") as f:
-            for chunk in r.iter_content(CHUNK):
-                if not chunk: continue
-                f.write(chunk)
-                done += len(chunk)
-                now = time.time()
-                if now - last >= UPD:
-                    el  = now - start
-                    sp  = done / el if el else 0
-                    pct = min(done / total_size * 100, 99) if total_size else 0
-                    eta = (total_size - done) / sp if sp and total_size else 0
-                    safe_edit(status_msg,
-                        f"⬇️ *Downloading Video*\n\n"
-                        f"`[{make_bar(pct)}]` `{pct:.1f}%`\n\n"
-                        f"📥 `{fmt_size(done)}`" +
-                        (f" / `{fmt_size(total_size)}`" if total_size else "") +
-                        f"\n⚡ Speed:   `{fmt_speed(sp)}`\n"
-                        f"⏱️ Elapsed: `{fmt_time(el)}`\n"
-                        f"⏳ ETA:     `{fmt_time(eta)}`"
-                    )
-                    last = now
-    return time.time() - start, done
+# ── Telethon Download with progress ──────────────────────────────────────────
+async def telethon_download(chat_id, message_id, dest, status_msg, total_size):
+    start = time.time()
+    last  = start
+    done  = [0]
 
+    def progress_cb(current, total):
+        done[0] = current
+        now = time.time()
+        nonlocal last
+        if now - last < 2: return
+        last = now
+        el  = now - start
+        sp  = current / el if el else 0
+        pct = min(current / total * 100, 99) if total else 0
+        eta = (total - current) / sp if sp and total else 0
+        safe_edit(status_msg,
+            f"⬇️ *Downloading Video*\n\n"
+            f"`[{make_bar(pct)}]` `{pct:.1f}%`\n\n"
+            f"📥 `{fmt_size(current)}`" +
+            (f" / `{fmt_size(total)}`" if total else "") +
+            f"\n⚡ Speed:   `{fmt_speed(sp)}`\n"
+            f"⏱️ Elapsed: `{fmt_time(el)}`\n"
+            f"⏳ ETA:     `{fmt_time(eta)}`"
+        )
+
+    async with tg_client:
+        msg = await tg_client.get_messages(chat_id, ids=message_id)
+        await tg_client.download_media(msg, file=str(dest), progress_callback=progress_cb)
+
+    elapsed = time.time() - start
+    return elapsed, done[0] or total_size
+
+# ── Sync wrapper for telethon download ───────────────────────────────────────
+def download_with_telethon(chat_id, message_id, dest, status_msg, total_size, loop):
+    return asyncio.run_coroutine_threadsafe(
+        telethon_download(chat_id, message_id, dest, status_msg, total_size),
+        loop
+    ).result()
+
+# ── Get duration ──────────────────────────────────────────────────────────────
 def get_duration(path):
     try:
         import subprocess
@@ -135,6 +152,7 @@ def get_duration(path):
         return float(r.stdout.strip())
     except: return 0.0
 
+# ── Compress with progress ────────────────────────────────────────────────────
 def compress_with_progress(cmd, dur, status_msg, res_key, crf, audio_br):
     import subprocess
     start  = time.time()
@@ -175,79 +193,107 @@ def compress_with_progress(cmd, dur, status_msg, res_key, crf, audio_br):
     proc.wait()
     return proc.returncode, "\n".join(buf), time.time() - start
 
-def upload_with_progress(chat_id, output_path, caption, thumb_path,
-                          status_msg, res_key, orig_size, comp_size, reply_to):
+# ── Telethon Upload with progress ─────────────────────────────────────────────
+async def telethon_upload(chat_id, reply_to_id, output_path, caption, thumb_path,
+                           status_msg, res_key, orig_size, comp_size):
     fsz       = output_path.stat().st_size
     start     = time.time()
-    done_flag = threading.Event()
-    err       = [None]
+    last      = start
     reduction = (orig_size - comp_size) / orig_size * 100 if orig_size else 0
-    SPEED     = 1.2 * (1 << 20)
+    SPEED     = 1.5 * (1 << 20)
 
-    def do_upload():
-        try:
-            with open(str(output_path), "rb") as vf:
-                thumb_f = open(thumb_path, "rb") if thumb_path and Path(thumb_path).exists() else None
-                bot.send_video(chat_id, vf, caption=caption, thumbnail=thumb_f,
-                               supports_streaming=True, parse_mode="Markdown",
-                               reply_to_message_id=reply_to)
-                if thumb_f: thumb_f.close()
-        except Exception as e:
-            err[0] = e
-        finally:
-            done_flag.set()
-
-    threading.Thread(target=do_upload, daemon=True).start()
-    while not done_flag.is_set():
-        time.sleep(2)
-        if done_flag.is_set(): break
-        el  = time.time() - start
-        est = min(el * SPEED, fsz * 0.97)
-        pct = min(est / fsz * 100, 97) if fsz else 50
-        sp  = est / el if el else SPEED
-        eta = (fsz - est) / sp if sp else 0
+    def progress_cb(current, total):
+        nonlocal last
+        now = time.time()
+        if now - last < 2: return
+        last = now
+        el  = now - start
+        sp  = current / el if el else SPEED
+        pct = min(current / total * 100, 97) if total else 50
+        eta = (total - current) / sp if sp else 0
         safe_edit(status_msg,
             f"⬆️ *Uploading — {res_key}*\n\n"
             f"`[{make_bar(pct)}]` `{pct:.1f}%`\n\n"
             f"📦 Size:     `{fmt_size(fsz)}`\n"
-            f"⚡ Speed:   `~{fmt_speed(sp)}`\n"
+            f"⚡ Speed:   `{fmt_speed(sp)}`\n"
             f"⏱️ Elapsed: `{fmt_time(el)}`\n"
             f"⏳ ETA:     `~{fmt_time(eta)}`\n\n"
             f"📉 Saved `{reduction:.1f}%`"
         )
-    if err[0]: raise err[0]
+
+    thumb = thumb_path if thumb_path and Path(thumb_path).exists() else None
+
+    async with tg_client:
+        await tg_client.send_file(
+            chat_id,
+            str(output_path),
+            caption=caption,
+            thumb=thumb,
+            supports_streaming=True,
+            reply_to=reply_to_id,
+            progress_callback=progress_cb,
+            parse_mode="md",
+        )
+
     return time.time() - start
 
-def run_pipeline(message, uid):
+def upload_with_telethon(chat_id, reply_to_id, output_path, caption, thumb_path,
+                          status_msg, res_key, orig_size, comp_size, loop):
+    return asyncio.run_coroutine_threadsafe(
+        telethon_upload(chat_id, reply_to_id, output_path, caption, thumb_path,
+                        status_msg, res_key, orig_size, comp_size),
+        loop
+    ).result()
+
+# ── Pipeline ──────────────────────────────────────────────────────────────────
+def run_pipeline(message, uid, loop):
     ud        = get_ud(uid)
-    vpath     = ud.get("video_path")
     tpath     = ud.get("thumbnail_path")
     title     = ud.get("title")
     res_key   = ud.get("resolution", "720p")
     preset    = ud.get("preset", RESOLUTIONS["720p"])
     orig_size = ud.get("total_size", 0)
+    msg_id    = ud.get("msg_id")
+    chat_id   = ud.get("chat_id")
     h, w, crf, abr = preset["h"], preset["w"], preset["crf"], preset["audio"]
 
-    if not vpath or not Path(vpath).exists():
-        bot.send_message(message.chat.id, "❌ Video nahi mili! Dobara bhejein.")
-        return
+    ext  = ud.get("ext", ".mp4")
+    dest = DOWNLOAD_DIR / f"{uid}_{int(time.time())}_input{ext}"
+    outp = OUTPUT_DIR   / f"{uid}_{int(time.time())}_{res_key}.mp4"
 
-    outp = OUTPUT_DIR / f"{uid}_{int(time.time())}_{res_key}.mp4"
-    dur  = get_duration(vpath)
+    # ── Download ──────────────────────────────────────────────────────────────
+    st = bot.send_message(message.chat.id,
+        f"⬇️ *Download shuru...*\n\n📁 `{fmt_size(orig_size)}`\n"
+        f"`[░░░░░░░░░░░░░░░░]` `0%`", parse_mode="Markdown")
+    try:
+        elapsed, dl = download_with_telethon(chat_id, msg_id, dest, st, orig_size, loop)
+        sp = dl / elapsed if elapsed else 0
+        safe_edit(st,
+            f"✅ *Download Complete!*\n\n"
+            f"`[████████████████]` `100%`\n\n"
+            f"📥 `{fmt_size(dl)}`\n"
+            f"⚡ Avg Speed: `{fmt_speed(sp)}`\n"
+            f"⏱️ Time: `{fmt_time(elapsed)}`")
+    except Exception as e:
+        safe_edit(st, f"❌ Download failed!\n`{e}`")
+        clear_ud(uid); return
 
+    # ── Compress ──────────────────────────────────────────────────────────────
+    dur  = get_duration(str(dest))
     cmsg = bot.send_message(message.chat.id,
         f"⚙️ *Compression shuru...*\n\n📐 `{res_key}` ({w}×{h}) | CRF `{crf}`\n"
         f"`[░░░░░░░░░░░░░░░░]` `0%`", parse_mode="Markdown")
 
     scale = (f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
              f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1")
-
-    cmd = ["ffmpeg", "-i", vpath, "-vf", scale,
+    cmd = ["ffmpeg", "-i", str(dest), "-vf", scale,
            "-c:v", "libx264", "-crf", str(crf), "-preset", "ultrafast",
            "-c:a", "aac", "-b:a", abr,
            "-movflags", "+faststart", "-y", str(outp)]
 
     rc, stderr, celapsed = compress_with_progress(cmd, dur, cmsg, res_key, crf, abr)
+    try: dest.unlink(missing_ok=True)
+    except: pass
 
     if rc != 0:
         safe_edit(cmsg, f"❌ *Compression failed!*\n\n```\n{stderr[-400:]}\n```")
@@ -264,6 +310,7 @@ def run_pipeline(message, uid):
         f"📉 Saved:      `{reduction:.1f}%`\n"
         f"⏱️ Time:       `{fmt_time(celapsed)}`")
 
+    # ── Upload ────────────────────────────────────────────────────────────────
     umsg = bot.send_message(message.chat.id,
         f"⬆️ *Upload shuru...*\n\n📦 `{fmt_size(csz)}`\n"
         f"`[░░░░░░░░░░░░░░░░]` `0%`", parse_mode="Markdown")
@@ -271,8 +318,10 @@ def run_pipeline(message, uid):
     caption = title or (f"🎬 *{res_key} Compressed*\n"
                         f"📉 `{reduction:.1f}%` reduced | 📐 `{w}×{h}` | 📦 `{fmt_size(csz)}`")
     try:
-        uel = upload_with_progress(message.chat.id, outp, caption, tpath, umsg,
-                                   res_key, orig_size, csz, message.message_id)
+        uel = upload_with_telethon(
+            message.chat.id, message.message_id,
+            outp, caption, tpath, umsg,
+            res_key, orig_size, csz, loop)
         safe_edit(umsg,
             f"✅ *Upload Complete!*\n\n"
             f"`[████████████████]` `100%`\n\n"
@@ -288,6 +337,7 @@ def run_pipeline(message, uid):
         try: outp.unlink(missing_ok=True)
         except: pass
 
+# ── Handlers ──────────────────────────────────────────────────────────────────
 @bot.message_handler(commands=["start"])
 def cmd_start(msg):
     if not is_owner(msg.from_user.id):
@@ -298,7 +348,8 @@ def cmd_start(msg):
         "⬇️ Download → ⚙️ Compress → ⬆️ Upload\n"
         "Har step ka real-time progress bar!\n\n"
         "📐 *Resolutions:* 144p / 360p / 480p / 720p / 1080p\n"
-        "🖼️ Thumbnail | ✏️ Title | 🔐 Owner only\n\n"
+        "🖼️ Thumbnail | ✏️ Title | 🔐 Owner only\n"
+        "📦 *1GB tak ki files support!*\n\n"
         "📤 *Video bhejein shuru karne ke liye!*\n"
         "/help | /cancel")
 
@@ -307,7 +358,7 @@ def cmd_help(msg):
     if not is_owner(msg.from_user.id): return
     bot.reply_to(msg,
         "📖 *Help*\n\n"
-        "1️⃣ Video bhejein (max 2GB)\n"
+        "1️⃣ Video bhejein (max 1GB)\n"
         "2️⃣ Resolution choose karein\n"
         "3️⃣ Thumbnail ya skip\n"
         "4️⃣ Title ya skip\n"
@@ -332,40 +383,32 @@ def handle_video(msg):
         if not mime.startswith("video/"):
             bot.reply_to(msg, "❗ Sirf video files bhejein!"); return
     total = getattr(video, "file_size", 0) or 0
-    if total > 2 * (1 << 30):
-        bot.reply_to(msg, "❗ Max 2GB!"); return
-    st = bot.reply_to(msg,
-        f"⬇️ *Download shuru...*\n\n📁 `{fmt_size(total)}`\n"
-        f"`[░░░░░░░░░░░░░░░░]` `0%`")
+    if total > 1 * (1 << 30):
+        bot.reply_to(msg, "❗ Max 1GB!"); return
+
     ext = ".mp4"
     if msg.document:
         fname = getattr(video, "file_name", None) or "video.mp4"
         ext   = Path(fname).suffix or ".mp4"
-    dest = DOWNLOAD_DIR / f"{uid}_{int(time.time())}_input{ext}"
 
-    def do_download():
-        try:
-            elapsed, dl = download_with_progress(video.file_id, dest, st, total)
-            sp = dl / elapsed if elapsed else 0
-            safe_edit(st,
-                f"✅ *Download Complete!*\n\n"
-                f"`[████████████████]` `100%`\n\n"
-                f"📥 `{fmt_size(dl)}`\n"
-                f"⚡ Avg Speed: `{fmt_speed(sp)}`\n"
-                f"⏱️ Time: `{fmt_time(elapsed)}`")
-            ud = get_ud(uid)
-            ud.update({"video_path": str(dest), "thumbnail_path": None,
-                       "title": None, "total_size": dl, "last_msg": msg})
-            bot.send_message(msg.chat.id,
-                "🎚️ *Resolution select karein:*\n\n"
-                "📱 *144p* — Sabse chhota\n📺 *360p* — Chhota\n"
-                "🖥️ *480p* — SD\n🔵 *720p* — HD *(Best)*\n🟣 *1080p* — Full HD",
-                parse_mode="Markdown", reply_markup=res_keyboard())
-        except Exception as e:
-            logger.error(f"Download error: {e}", exc_info=True)
-            safe_edit(st, f"❌ Download failed!\n`{e}`")
+    ud = get_ud(uid)
+    ud.update({
+        "thumbnail_path": None,
+        "title":          None,
+        "total_size":     total,
+        "last_msg":       msg,
+        "msg_id":         msg.message_id,
+        "chat_id":        msg.chat.id,
+        "ext":            ext,
+    })
 
-    threading.Thread(target=do_download, daemon=True).start()
+    kb = res_keyboard()
+    bot.reply_to(msg,
+        f"📁 File: `{fmt_size(total)}`\n\n"
+        "🎚️ *Resolution select karein:*\n\n"
+        "📱 *144p* — Sabse chhota\n📺 *360p* — Chhota\n"
+        "🖥️ *480p* — SD\n🔵 *720p* — HD *(Best)*\n🟣 *1080p* — Full HD",
+        parse_mode="Markdown", reply_markup=kb)
 
 @bot.callback_query_handler(func=lambda c: c.data.startswith("res_"))
 def cb_resolution(call):
@@ -397,59 +440,75 @@ def cb_skip_thumb(call):
 def handle_thumbnail(msg):
     uid = msg.from_user.id
     ud  = get_ud(uid)
-    if "resolution" not in ud or "thumbnail_path" not in ud:
-        return
-    if ud.get("thumbnail_path") is not None:
-        return
+    if "resolution" not in ud or "thumbnail_path" not in ud: return
+    if ud.get("thumbnail_path") is not None: return
     st = bot.reply_to(msg, "⬇️ Thumbnail download...")
     try:
         fobj = msg.photo[-1]
         fi   = bot.get_file(fobj.file_id)
         url  = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{fi.file_path}"
         path = DOWNLOAD_DIR / f"{uid}_{int(time.time())}_thumb.jpg"
-        r    = requests.get(url)
-        path.write_bytes(r.content)
+        path.write_bytes(requests.get(url).content)
         ud["thumbnail_path"] = str(path)
         safe_edit(st, "✅ Thumbnail set!")
-        bot.send_message(msg.chat.id,
-            "✏️ *Title* (optional)\nText likhein ya skip:",
+        bot.send_message(msg.chat.id, "✏️ *Title* (optional)\nText likhein ya skip:",
             parse_mode="Markdown", reply_markup=skip_kb("skip_title", "Title"))
     except Exception as e:
         ud["thumbnail_path"] = None
         safe_edit(st, f"⚠️ Thumbnail skip (error: {e})")
-        bot.send_message(msg.chat.id,
-            "✏️ *Title* (optional)\nText likhein ya skip:",
+        bot.send_message(msg.chat.id, "✏️ *Title* (optional)\nText likhein ya skip:",
             parse_mode="Markdown", reply_markup=skip_kb("skip_title", "Title"))
 
 @bot.callback_query_handler(func=lambda c: c.data == "skip_title")
 def cb_skip_title(call):
-    uid = call.from_user.id
-    ud  = get_ud(uid)
+    uid  = call.from_user.id
+    ud   = get_ud(uid)
     ud["title"] = None
     bot.answer_callback_query(call.id)
     bot.edit_message_text("⏭️ Title skip!", call.message.chat.id, call.message.message_id)
-    msg = ud.get("last_msg", call.message)
-    threading.Thread(target=run_pipeline, args=(msg, uid), daemon=True).start()
+    msg  = ud.get("last_msg", call.message)
+    loop = asyncio.get_event_loop()
+    threading.Thread(target=run_pipeline, args=(msg, uid, loop), daemon=True).start()
 
 @bot.message_handler(content_types=["text"])
 def handle_title(msg):
     uid = msg.from_user.id
     ud  = get_ud(uid)
     if "resolution" not in ud: return
-    if "video_path" not in ud: return
+    if "msg_id" not in ud: return
     if ud.get("title") is not None: return
     text = msg.text.strip()
     if text.startswith("/"): return
     ud["title"] = text
     bot.reply_to(msg, f"✅ Title: _{text}_", parse_mode="Markdown")
-    src = ud.get("last_msg", msg)
-    threading.Thread(target=run_pipeline, args=(src, uid), daemon=True).start()
+    src  = ud.get("last_msg", msg)
+    loop = asyncio.get_event_loop()
+    threading.Thread(target=run_pipeline, args=(src, uid, loop), daemon=True).start()
 
+# ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     if not BOT_TOKEN:
         logger.error("BOT_TOKEN set nahi!"); return
+    if not API_ID or not API_HASH:
+        logger.error("API_ID aur API_HASH set karo Render environment variables mein!"); return
+
     logger.info(f"Owner ID: {OWNER_ID if OWNER_ID else 'Not set (open)'}")
-    logger.info("✅ Bot polling shuru (pyTelegramBotAPI)...")
+
+    # Start asyncio loop in background thread
+    loop = asyncio.new_event_loop()
+    def start_loop(loop):
+        asyncio.set_event_loop(loop)
+        loop.run_forever()
+    t = threading.Thread(target=start_loop, args=(loop,), daemon=True)
+    t.start()
+
+    # Connect telethon client
+    async def connect_client():
+        await tg_client.start(bot_token=BOT_TOKEN)
+        logger.info("✅ Telethon client connected!")
+    asyncio.run_coroutine_threadsafe(connect_client(), loop).result()
+
+    logger.info("✅ Bot polling shuru...")
     bot.infinity_polling(timeout=60, long_polling_timeout=30)
 
 if __name__ == "__main__":
