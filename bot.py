@@ -1,19 +1,16 @@
 """
 Advanced Telegram Video Compressor Bot
-- Telethon for large file download/upload (1GB+)
-- pyTelegramBotAPI for UI
-- Progress bars for all steps
+- Telethon :memory: session (no database lock)
+- Separate event loop per thread
+- Progress bars: Download / Compress / Upload
 - Resolution: 144p 360p 480p 720p 1080p
 """
 
-import os, re, time, logging, threading
+import os, re, time, logging, threading, asyncio
 from pathlib import Path
 import requests
 import telebot
 from telebot import types
-import asyncio
-from telethon.sync import TelegramClient
-from telethon import functions
 
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -96,16 +93,26 @@ def skip_kb(cb_data, label):
     kb.add(types.InlineKeyboardButton(f"⏭️ Skip {label}", callback_data=cb_data))
     return kb
 
+# ── Run async in new event loop (thread-safe) ─────────────────────────────────
+def run_async(coro):
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        loop.close()
+
 # ── Telethon Download ─────────────────────────────────────────────────────────
-def telethon_download(chat_id, message_id, dest, status_msg, total_size):
-    start = [time.time()]
-    last  = [start[0]]
+async def _download(chat_id, message_id, dest, status_msg, total_size):
+    from telethon import TelegramClient
+    start = time.time()
+    last  = [start]
 
     def progress_cb(current, total):
         now = time.time()
         if now - last[0] < 2: return
         last[0] = now
-        el  = now - start[0]
+        el  = now - start
         sp  = current / el if el else 0
         pct = min(current / total * 100, 99) if total else 0
         eta = (total - current) / sp if sp and total else 0
@@ -119,28 +126,34 @@ def telethon_download(chat_id, message_id, dest, status_msg, total_size):
             f"⏳ ETA:     `{fmt_time(eta)}`"
         )
 
-    with TelegramClient("bot_session", API_ID, API_HASH) as client:
-        client.start(bot_token=BOT_TOKEN)
-        msg = client.get_messages(chat_id, ids=message_id)
-        client.download_media(msg, file=str(dest), progress_callback=progress_cb)
+    # :memory: session = no database file = no lock
+    async with TelegramClient(":memory:", API_ID, API_HASH) as client:
+        await client.start(bot_token=BOT_TOKEN)
+        msg = await client.get_messages(chat_id, ids=message_id)
+        await client.download_media(msg, file=str(dest),
+                                    progress_callback=progress_cb)
 
-    elapsed = time.time() - start[0]
+    elapsed = time.time() - start
     actual  = dest.stat().st_size if dest.exists() else total_size
     return elapsed, actual
 
+def telethon_download(chat_id, message_id, dest, status_msg, total_size):
+    return run_async(_download(chat_id, message_id, dest, status_msg, total_size))
+
 # ── Telethon Upload ───────────────────────────────────────────────────────────
-def telethon_upload(chat_id, reply_to_id, output_path, caption,
-                    thumb_path, status_msg, res_key, orig_size, comp_size):
+async def _upload(chat_id, reply_to_id, output_path, caption,
+                  thumb_path, status_msg, res_key, orig_size, comp_size):
+    from telethon import TelegramClient
     fsz       = output_path.stat().st_size
-    start     = [time.time()]
-    last      = [start[0]]
+    start     = time.time()
+    last      = [start]
     reduction = (orig_size - comp_size) / orig_size * 100 if orig_size else 0
 
     def progress_cb(current, total):
         now = time.time()
         if now - last[0] < 2: return
         last[0] = now
-        el  = now - start[0]
+        el  = now - start
         sp  = current / el if el else 0
         pct = min(current / total * 100, 97) if total else 50
         eta = (total - current) / sp if sp else 0
@@ -156,9 +169,9 @@ def telethon_upload(chat_id, reply_to_id, output_path, caption,
 
     thumb = thumb_path if thumb_path and Path(thumb_path).exists() else None
 
-    with TelegramClient("bot_session", API_ID, API_HASH) as client:
-        client.start(bot_token=BOT_TOKEN)
-        client.send_file(
+    async with TelegramClient(":memory:", API_ID, API_HASH) as client:
+        await client.start(bot_token=BOT_TOKEN)
+        await client.send_file(
             chat_id,
             str(output_path),
             caption=caption,
@@ -169,7 +182,12 @@ def telethon_upload(chat_id, reply_to_id, output_path, caption,
             parse_mode="md",
         )
 
-    return time.time() - start[0]
+    return time.time() - start
+
+def telethon_upload(chat_id, reply_to_id, output_path, caption,
+                    thumb_path, status_msg, res_key, orig_size, comp_size):
+    return run_async(_upload(chat_id, reply_to_id, output_path, caption,
+                             thumb_path, status_msg, res_key, orig_size, comp_size))
 
 # ── Get duration ──────────────────────────────────────────────────────────────
 def get_duration(path):
@@ -466,8 +484,7 @@ def main():
         logger.error("BOT_TOKEN set nahi!"); return
     if not API_ID or not API_HASH:
         logger.error("API_ID aur API_HASH set karo!"); return
-
-    logger.info(f"Owner ID: {OWNER_ID if OWNER_ID else 'Not set (open)'}")
+    logger.info(f"Owner: {OWNER_ID if OWNER_ID else 'Open'}")
     logger.info("✅ Bot polling shuru...")
     bot.infinity_polling(timeout=60, long_polling_timeout=30)
 
