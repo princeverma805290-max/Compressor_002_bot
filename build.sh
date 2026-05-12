@@ -1,5 +1,6 @@
 #!/bin/bash
 set -e
+
 echo "=== FFmpeg install ==="
 apt-get update -qq && apt-get install -y ffmpeg
 ffmpeg -version | head -1
@@ -11,5 +12,6 @@ echo "=== Install packages ==="
 pip install --no-cache-dir pyTelegramBotAPI==4.20.0 requests==2.31.0
 
 echo "=== Verify ==="
-python3 -c "import telebot; print('telebot version:', telebot.__version__)"
+python3 -c "import telebot; print('pyTelegramBotAPI installed OK')"
+
 echo "=== Build complete! ==="
